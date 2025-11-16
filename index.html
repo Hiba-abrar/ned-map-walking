@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NED Grid Navigation</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: #f5f5f5; }
+        .header { background: #1e40af; color: white; padding: 1rem; text-align: center; }
+        .container { position: relative; height: calc(100vh - 80px); }
+        #map { width: 100%; height: 100%; }
+        .panel { position: absolute; top: 20px; left: 20px; z-index: 1000; background: white; padding: 1rem; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 280px; }
+        .status { color: #059669; font-weight: bold; margin-bottom: 0.5rem; font-size: 0.9rem; }
+        .grid-display { font-family: monospace; background: #f0f0f0; padding: 0.5rem; border-radius: 4px; margin: 0.5rem 0; font-size: 0.8rem; }
+        .commands { font-size: 0.8rem; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>NED Grid Navigation</h1>
+        <p>Left, Right, Straight Instructions</p>
+    </div>
+    
+    <div class="container">
+        <div id="map"></div>
+        
+        <div class="panel">
+            <div class="status" id="status">Grid Navigation Ready</div>
+            <div class="grid-display" id="gridDisplay">← ↑ → Route Display</div>
+            <div class="commands">
+                "start navigation"<br>
+                "use my location"<br>
+                "repeat" / "next"
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        const map = L.map('map').setView([24.9325, 67.1139], 16);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+        const locations = {
+            "NED University Admin Block": [24.9328525, 67.1099341],
+            "NED University Library": [24.933102716272494, 67.11100098699812],
+            "CSIT Labs": [24.931374111201748, 67.11398043939803],
+            "NED University Main Gate": [24.9299167, 67.1156389],
+            "Basketball Court": [24.932403048156, 67.1165460313555],
+            "Football Ground": [24.932149578523966, 67.116210098944],
+            "DMS Cafeteria": [24.932394422988278, 67.1141342937413],
+            "NED Medical Centre": [24.932181120075303, 67.11088250500814],
+            "Mosque": [24.9338711062338, 67.11102216552638],
+            "Main Auditorium": [24.93190295462124, 67.1126189323467],
+            "Survey Lab": [24.9305, 67.1140],
+            "NED Ground": [24.9320, 67.1150]
+        };
+
+        let recognition, isListening = false, currentStep = 'waiting';
+        let startLocation = null, endLocation = null, route = [], stepIndex = 0;
+        let userPos = null, posWatcher = null;
+
+        function speak(text) {
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.rate = 0.8;
+            speechSynthesis.speak(utterance);
+            document.getElementById('status').textContent = text;
+        }
+
+        function updateGridDisplay(gridText) {
+            document.getElementById('gridDisplay').textContent = gridText;
+        }
+
+        function haversine(lat1, lon1, lat2, lon2) {
+            const R = 6371000;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = Math.sin(dLat/2) * Math.sin(dLat/2) + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon/2) * Math.sin(dLon/2);
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        }
+
+        function calculateBearing(lat1, lon1, lat2, lon2) {
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const y = Math.sin(dLon) * Math.cos(lat2 * Math.PI / 180);
+            const x = Math.cos(lat1 * Math.PI / 180) * Math.sin(lat2 * Math.PI / 180) - Math.sin(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.cos(dLon);
+            return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+        }
+
+        function getGridDirection(prevBearing, nextBearing) {
+            let diff = nextBearing - prevBearing;
+            if (diff > 180) diff -= 360;
+            if (diff < -180) diff += 360;
+            
+            if (Math.abs(diff) < 30) return "↑";
+            return diff > 0 ? "→" : "←";
+        }
+
+        function calculateGridRoute(startLat, startLon, endLat, endLon, startName, endName) {
+            const pathPoints = [
+                [startLat, startLon],
+                [startLat + (endLat - startLat) * 0.3, startLon + (endLon - startLon) * 0.3],
+                [startLat + (endLat - startLat) * 0.7, startLon + (endLon - startLon) * 0.7],
+                [endLat, endLon]
+            ];
+            
+            const steps = [];
+            const gridDisplay = [];
+            
+            for (let i = 0; i < pathPoints.length; i++) {
+                const step = { location: pathPoints[i], instruction: "", distance: 0, isTurn: false, turnDirection: "straight" };
+                
+                if (i === 0) {
+                    step.instruction = "Start from " + startName;
+                    gridDisplay.push("📍");
+                } else if (i === pathPoints.length - 1) {
+                    step.instruction = "Arrived at " + endName;
+                    gridDisplay.push("🎯");
+                } else {
+                    const prevBearing = calculateBearing(pathPoints[i-1][0], pathPoints[i-1][1], pathPoints[i][0], pathPoints[i][1]);
+                    const nextBearing = calculateBearing(pathPoints[i][0], pathPoints[i][1], pathPoints[i+1][0], pathPoints[i+1][1]);
+                    
+                    let diff = nextBearing - prevBearing;
+                    if (diff > 180) diff -= 360;
+                    if (diff < -180) diff += 360;
+                    
+                    if (Math.abs(diff) < 30) {
+                        step.instruction = "Continue straight";
+                        step.turnDirection = "straight";
+                        gridDisplay.push("↑");
+                    } else if (diff > 0) {
+                        step.instruction = "Turn right";
+                        step.turnDirection = "right";
+                        step.isTurn = true;
+                        gridDisplay.push("→");
+                    } else {
+                        step.instruction = "Turn left";
+                        step.turnDirection = "left";
+                        step.isTurn = true;
+                        gridDisplay.push("←");
+                    }
+                }
+                
+                if (i < pathPoints.length - 1) {
+                    step.distance = haversine(pathPoints[i][0], pathPoints[i][1], pathPoints[i+1][0], pathPoints[i+1][1]);
+                }
+                
+                steps.push(step);
+            }
+            
+            updateGridDisplay(gridDisplay.join(" → "));
+            return steps;
+        }
+
+        function initVoice() {
+            if ('webkitSpeechRecognition' in window) {
+                recognition = new webkitSpeechRecognition();
+                recognition.continuous = true;
+                recognition.lang = 'en-US';
+                
+                recognition.onresult = function(event) {
+                    const command = event.results[event.results.length - 1][0].transcript.toLowerCase();
+                    processCommand(command);
+                };
+                
+                recognition.onend = function() {
+                    if (isListening) setTimeout(() => recognition.start(), 100);
+                };
+                
+                startListening();
+            }
+        }
+
+        function startListening() {
+            if (recognition && !isListening) {
+                isListening = true;
+                recognition.start();
+                speak('Grid navigation ready. Say "start navigation"');
+            }
+        }
+
+        function processCommand(command) {
+            if (command.includes('start navigation')) {
+                currentStep = 'start';
+                speak('Say starting location or "use my location"');
+            } else if (currentStep === 'start' && command.includes('use my location')) {
+                useCurrentLocation();
+            } else if (currentStep === 'start') {
+                setStart(command);
+            } else if (currentStep === 'destination') {
+                setDestination(command);
+            } else if (command.includes('repeat')) {
+                repeatInstruction();
+            } else if (command.includes('next')) {
+                nextInstruction();
+            } else if (command.includes('stop')) {
+                stopNavigation();
+            }
+        }
+
+        function useCurrentLocation() {
+            if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(pos => {
+                    let nearest = null, minDist = Infinity;
+                    for (const [name, coords] of Object.entries(locations)) {
+                        const dist = haversine(pos.coords.latitude, pos.coords.longitude, coords[0], coords[1]);
+                        if (dist < minDist) {
+                            minDist = dist;
+                            nearest = name;
+                        }
+                    }
+                    if (nearest && minDist < 100) {
+                        startLocation = nearest;
+                        speak(Start: ${nearest}. Say destination.);
+                        currentStep = 'destination';
+                    } else {
+                        speak('Location not found. Say specific location.');
+                    }
+                });
+            }
+        }
+
+        function setStart(command) {
+            const location = findLocation(command);
+            if (location) {
+                startLocation = location;
+                speak(Start: ${location}. Say destination.);
+                currentStep = 'destination';
+            } else {
+                speak('Location not found. Try again.');
+            }
+        }
+
+        function setDestination(command) {
+            const location = findLocation(command);
+            if (location) {
+                endLocation = location;
+                speak(Destination: ${location}. Calculating grid route...);
+                calculateAndStart();
+            } else {
+                speak('Destination not found. Try again.');
+            }
+        }
+
+        function findLocation(command) {
+            for (const location of Object.keys(locations)) {
+                if (command.includes(location.toLowerCase())) return location;
+            }
+            
+            const keywords = {
+                'main gate': 'NED University Main Gate',
+                'library': 'NED University Library',
+                'admin': 'NED University Admin Block',
+                'csit': 'CSIT Labs',
+                'cafeteria': 'DMS Cafeteria',
+                'basketball': 'Basketball Court',
+                'football': 'Football Ground',
+                'medical': 'NED Medical Centre',
+                'mosque': 'Mosque',
+                'auditorium': 'Main Auditorium',
+                'survey': 'Survey Lab',
+                'ground': 'NED Ground'
+            };
+            
+            for (const [keyword, location] of Object.entries(keywords)) {
+                if (command.includes(keyword)) return location;
+            }
+            
+            return null;
+        }
+
+        function calculateAndStart() {
+            const startCoords = locations[startLocation];
+            const endCoords = locations[endLocation];
+            
+            route = calculateGridRoute(startCoords[0], startCoords[1], endCoords[0], endCoords[1], startLocation, endLocation);
+            
+            const totalDist = route.reduce((sum, step) => sum + step.distance, 0);
+            speak(Grid route ready. ${Math.round(totalDist)} meters. Starting GPS.);
+            
+            addRouteToMap();
+            startGPS();
+            
+            currentStep = 'navigating';
+            stepIndex = 0;
+            
+            if (route.length > 0) speak(route[0].instruction);
+        }
+
+        function addRouteToMap() {
+            map.eachLayer(layer => {
+                if (layer instanceof L.Marker || layer instanceof L.Polyline) map.removeLayer(layer);
+            });
+            
+            L.marker(route[0].location).addTo(map).bindPopup(Start: ${startLocation});
+            L.marker(route[route.length - 1].location).addTo(map).bindPopup(End: ${endLocation});
+            
+            const coords = route.map(step => step.location);
+            L.polyline(coords, {color: '#1e40af', weight: 4}).addTo(map);
+            
+            // Add turn markers
+            route.forEach((step, i) => {
+                if (step.isTurn) {
+                    const icon = step.turnDirection === 'left' ? '←' : '→';
+                    L.marker(step.location, {
+                        icon: L.divIcon({html: icon, iconSize: [16, 16], className: 'turn-marker'})
+                    }).addTo(map);
+                }
+            });
+            
+            const group = new L.featureGroup([L.marker(route[0].location), L.marker(route[route.length - 1].location)]);
+            map.fitBounds(group.getBounds().pad(0.1));
+        }
+
+        function startGPS() {
+            if (navigator.geolocation) {
+                posWatcher = navigator.geolocation.watchPosition(pos => {
+                    userPos = {lat: pos.coords.latitude, lon: pos.coords.longitude};
+                    updateUserMarker();
+                    checkProgress();
+                }, null, {enableHighAccuracy: true, timeout: 10000, maximumAge: 1000});
+                
+                speak('GPS tracking started. Follow grid instructions.');
+            }
+        }
+
+        function updateUserMarker() {
+            if (window.userMarker) map.removeLayer(window.userMarker);
+            window.userMarker = L.marker([userPos.lat, userPos.lon], {
+                icon: L.divIcon({html: '📍', iconSize: [20, 20]})
+            }).addTo(map);
+        }
+
+        function checkProgress() {
+            if (!userPos || !route.length || stepIndex >= route.length) return;
+            
+            const target = route[stepIndex];
+            const dist = haversine(userPos.lat, userPos.lon, target.location[0], target.location[1]);
+            
+            if (target.isTurn && dist <= 10 && dist > 5) {
+                speak(target.instruction);
+            }
+            
+            if (dist < 8) {
+                stepIndex++;
+                if (stepIndex >= route.length) {
+                    speak(Arrived at ${endLocation}. Navigation complete!);
+                    stopNavigation();
+                } else {
+                    const next = route[stepIndex];
+                    if (next.instruction && !next.isTurn) speak(next.instruction);
+                }
+            }
+            
+            if (dist > 50 && Math.floor(dist / 50) !== Math.floor((dist + 3) / 50)) {
+                speak(Continue straight for ${Math.round(dist)} meters);
+            }
+        }
+
+        function repeatInstruction() {
+            if (currentStep === 'navigating' && route.length > 0 && stepIndex < route.length) {
+                speak(route[stepIndex].instruction);
+            }
+        }
+
+        function nextInstruction() {
+            if (currentStep === 'navigating' && route.length > 0) {
+                stepIndex = Math.min(stepIndex + 1, route.length - 1);
+                speak(route[stepIndex].instruction);
+            }
+        }
+
+        function stopNavigation() {
+            currentStep = 'waiting';
+            startLocation = null;
+            endLocation = null;
+            route = [];
+            stepIndex = 0;
+            
+            if (posWatcher) {
+                navigator.geolocation.clearWatch(posWatcher);
+                posWatcher = null;
+            }
+            
+            updateGridDisplay("← ↑ → Route Display");
+            speak('Navigation stopped. Say "start navigation" for new route.');
+        }
+
+        window.addEventListener('load', () => {
+            navigator.mediaDevices.getUserMedia({audio: true})
+                .then(() => initVoice())
+                .catch(() => speak('Microphone access denied'));
+            
+            for (const [name, coords] of Object.entries(locations)) {
+                L.marker(coords).addTo(map).bindPopup(name);
+            }
+            
+            speak('NED Grid Navigation loaded. Left, right, straight instructions only.');
+        });
+    </script>
+</body>
+</html>
